@@ -697,19 +697,9 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 // QueryContext executes a query that may return rows, such as a SELECT.
 // It implements the driver.StmtQueryContext interface.
 func (s *Stmt) QueryContext(ctx context.Context, nargs []driver.NamedValue) (driver.Rows, error) {
-	cleanupCtx := s.conn.setContext(ctx)
-	defer cleanupCtx()
-
-	var res *mapping.Result
-	if err := runWithCtxInterrupt(ctx, s.conn.conn, func(wctx context.Context) error {
-		var executeErr error
-		res, executeErr = s.execute(wctx, nargs, streamingResults(ctx))
-		return executeErr
-	}); err != nil {
-		return nil, err
-	}
-	s.rows = true
-	return newRowsWithStmt(*res, s), nil
+	return s.queryRows(ctx, func(wctx context.Context, streaming bool) (*mapping.Result, error) {
+		return s.execute(wctx, nargs, streaming)
+	})
 }
 
 // QueryBound executes a bound query that may return rows, such as a SELECT.
@@ -726,20 +716,47 @@ func (s *Stmt) QueryBound(ctx context.Context) (driver.Rows, error) {
 		return nil, errNotBound
 	}
 
+	return s.queryRows(ctx, s.executeBound)
+}
+
+func (s *Stmt) queryRows(ctx context.Context, execute func(context.Context, bool) (*mapping.Result, error)) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cleanupCtx := s.conn.setContext(ctx)
-	defer cleanupCtx()
+	streaming := streamingResults(ctx)
+	stop := cleanupCtx
+	wctx := ctx
+	if streaming {
+		var stopInterrupt func()
+		wctx, stopInterrupt = startCtxInterrupt(ctx, s.conn.conn)
+		stop = func() {
+			stopInterrupt()
+			cleanupCtx()
+		}
+	}
+	defer func() {
+		if stop != nil {
+			stop()
+		}
+	}()
 
 	var res *mapping.Result
-	if err := runWithCtxInterrupt(ctx, s.conn.conn, func(wctx context.Context) error {
-		var executeBoundErr error
-		res, executeBoundErr = s.executeBound(wctx, streamingResults(ctx))
-		return executeBoundErr
+	if err := runWithCtxInterrupt(wctx, s.conn.conn, func(execCtx context.Context) error {
+		var err error
+		res, err = execute(execCtx, streaming)
+		return err
 	}); err != nil {
 		return nil, err
 	}
-
 	s.rows = true
-	return newRowsWithStmt(*res, s), nil
+	r := newRowsWithStmt(*res, s)
+	if streaming {
+		r.ctxErr = ctx.Err
+		r.stop = stop
+		stop = nil
+	}
+	return r, nil
 }
 
 // This method executes the query in steps and checks if context is cancelled before executing each step.

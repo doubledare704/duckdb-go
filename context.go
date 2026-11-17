@@ -55,6 +55,8 @@ func (s *contextStore) delete(connId uint64) {
 // How frequently to `duckdb_interrupt` after ctx cancellation while the DuckDB call is still executing.
 var interruptInterval = 500 * time.Millisecond
 
+type interruptActiveKey struct{}
+
 // runWithCtxInterrupt runs the function fn (which runs DuckDB mapping call/s),
 // and robustly propagates ctx cancellation to DuckDB by repeatedly calling
 // mapping.Interrupt on the given connection while the call is in flight.
@@ -82,33 +84,25 @@ func runWithCtxInterrupt(ctx context.Context, conn mapping.Connection, fn func(c
 
 	// guard: if an interrupter is already active for this call, don’t spawn another.
 	// We tag the context to indicate an active interrupter scope.
-	type interruptActiveKey struct{}
 	if ctx.Value(interruptActiveKey{}) != nil {
 		return fn(ctx)
 	}
+	wctx, stop := startCtxInterrupt(ctx, conn)
+	defer stop()
+	return fn(wctx)
+}
+
+// startCtxInterrupt returns a stop function that joins the interrupter before
+// the connection can be used again.
+func startCtxInterrupt(ctx context.Context, conn mapping.Connection) (context.Context, func()) {
 	ctx = context.WithValue(ctx, interruptActiveKey{}, struct{}{})
-
-	bgDoneCh := make(chan struct{})
 	done := make(chan struct{})
-
-	go interrupterRoutine(ctx, conn, done, bgDoneCh)
-
-	// Stop the interrupter in a deferred call, so that it also stops if fn panics.
-	// Callers may recover the panic and keep using the connection. A leftover
-	// interrupter would then interrupt every later query on this connection once ctx
-	// is canceled, and call Interrupt on a freed connection after it is closed.
-	defer func() {
+	bgDone := make(chan struct{})
+	go interrupterRoutine(ctx, conn, done, bgDone)
+	return ctx, func() {
 		close(done)
-
-		// Wait for interrupter goroutine to finish
-		// Sometimes the go-routine is not scheduled immediately.
-		// By the time it is scheduled, another query might be running on this connection.
-		// If we don't wait for the go-routine to finish, it can cancel that new query.
-		<-bgDoneCh
-	}()
-
-	// We pass `ctx` to keep that "enriched" context with the mark that we've already spawned a go-routine
-	return fn(ctx)
+		<-bgDone
+	}
 }
 
 func interrupterRoutine(ctx context.Context, conn mapping.Connection, done <-chan struct{}, bgDoneCh chan<- struct{}) {

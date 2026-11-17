@@ -79,6 +79,20 @@ func (conn *Conn) ExecContext(ctx context.Context, query string, args []driver.N
 // QueryContext executes a query that may return rows, such as a SELECT.
 // It implements the driver.QueryerContext interface.
 func (conn *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if streamingResults(ctx) {
+		var prepared *Stmt
+		err := runWithCtxInterrupt(ctx, conn.conn, func(wctx context.Context) error {
+			defer conn.setContext(ctx)()
+			var err error
+			prepared, err = conn.prepareStmts(wctx, query)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return queryPrepared(ctx, prepared, args)
+	}
+
 	cleanupCtx := conn.setContext(ctx)
 	defer cleanupCtx()
 
@@ -89,23 +103,25 @@ func (conn *Conn) QueryContext(ctx context.Context, query string, args []driver.
 			return err
 		}
 
-		r, err := prepared.QueryContext(wctx, args)
-		if err != nil {
-			errClose := prepared.Close()
-			if errClose != nil {
-				return errors.Join(err, errClose)
-			}
-			return err
-		}
-		// We must close the prepared statement after closing the rows r.
-		prepared.closeOnRowsClose = true
-		rows = r
-		return nil
+		rows, err = queryPrepared(wctx, prepared, args)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return rows, nil
+}
+
+func queryPrepared(ctx context.Context, prepared *Stmt, args []driver.NamedValue) (driver.Rows, error) {
+	r, err := prepared.QueryContext(ctx, args)
+	if err != nil {
+		if closeErr := prepared.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
+	}
+	prepared.closeOnRowsClose = true
+	return r, nil
 }
 
 // PrepareContext returns a prepared statement, bound to this connection.

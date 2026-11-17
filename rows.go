@@ -2,6 +2,7 @@ package duckdb
 
 import (
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -12,6 +13,9 @@ import (
 
 // rows is a helper struct for scanning a duckdb result.
 type rows struct {
+	closed bool
+	ctxErr func() error
+	stop   func()
 	// stmt is a pointer to the stmt of which we are scanning the result.
 	stmt *Stmt
 	// res is the result of stmt.
@@ -57,6 +61,33 @@ func (r *rows) Columns() []string {
 }
 
 func (r *rows) Next(dst []driver.Value) error {
+	if r.closed {
+		return io.EOF
+	}
+	if r.ctxErr == nil {
+		return r.next(dst)
+	}
+
+	err := r.ctxErr()
+	if err == nil {
+		err = r.next(dst)
+		if ctxErr := r.ctxErr(); ctxErr != nil {
+			err = ctxErr
+		}
+	}
+	if err != nil {
+		closeErr := r.Close()
+		if closeErr != nil {
+			if errors.Is(err, io.EOF) {
+				return closeErr
+			}
+			return errors.Join(err, closeErr)
+		}
+	}
+	return err
+}
+
+func (r *rows) next(dst []driver.Value) error {
 	for r.rowCount == r.chunk.size {
 		if r.closeChunk {
 			r.chunk.close()
@@ -173,21 +204,30 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 }
 
 func (r *rows) Close() error {
+	if r.closed {
+		return nil
+	}
 	if r.closeChunk {
 		r.chunk.close()
 	}
+	r.closed = true
 	mapping.DestroyResult(&r.res)
 
-	var err error
-	if r.stmt != nil {
-		r.stmt.rows = false
-		if r.stmt.closeOnRowsClose {
-			err = r.stmt.Close()
-		}
-		r.stmt = nil
+	if r.stop != nil {
+		r.stop()
+		r.stop = nil
+		r.ctxErr = nil
 	}
-
-	return err
+	stmt := r.stmt
+	r.stmt = nil
+	if stmt == nil {
+		return nil
+	}
+	stmt.rows = false
+	if stmt.closeOnRowsClose {
+		return stmt.Close()
+	}
+	return nil
 }
 
 // logicalTypeString converts a LogicalType to its string representation.
